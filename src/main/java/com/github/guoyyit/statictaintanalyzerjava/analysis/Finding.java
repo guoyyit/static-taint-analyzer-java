@@ -20,6 +20,11 @@ public record Finding(String fingerprint,
     public static final String STATUS_UNCHANGED = "UNCHANGED";
     public static final String STATUS_REMOVED = "REMOVED";
 
-    public record Step(String file, String function, String variable, int line, String kind) {
+    public record Step(String file, String className, String function, String variable, int line, String kind) {
+
+        /** Constructor used by the legacy DSL frontend (no owning class). */
+        public Step(String file, String function, String variable, int line, String kind) {
+            this(file, "", function, variable, line, kind);
+        }
     }
 }

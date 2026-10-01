@@ -25,7 +25,8 @@ public class AnalysisController {
         this.service = service;
     }
 
-    public record SubmitRequest(Map<String, String> files, String rules, String jobId) {
+    public record SubmitRequest(Map<String, String> files, String rules, String jobId,
+                                java.util.List<String> directories) {
     }
 
     public record SubmitResponse(String jobId) {
@@ -33,7 +34,8 @@ public class AnalysisController {
 
     @PostMapping("/analyses")
     public SubmitResponse submit(@PathVariable String project, @RequestBody SubmitRequest req) {
-        String jobId = service.submit(project, req.files(), req.rules(), req.jobId());
+        String jobId = service.submit(project, req.files(), req.rules(), req.jobId(),
+                req.directories() == null ? java.util.List.of() : req.directories());
         return new SubmitResponse(jobId);
     }
 

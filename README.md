@@ -1,7 +1,12 @@
 # Static Taint Analyzer (Java)
 
-本地源代码污点分析服务：从数据入口（source）追踪不可信值向敏感汇点（sink）的传播路径，
+本地污点分析服务：从数据入口（source）追踪不可信值向敏感汇点（sink）的传播路径，
 产出**可复现、可审计**的分析结论。基于 Spring Boot，数据全部落在本地文件系统。
+
+当前支持两类输入：
+
+- **真实 Java 源代码（`.java`）**：跨方法、跨类、跨包的过程间污点分析（详见下文）。
+- **历史 DSL（`.req` 等任意非 `.java` 键）**：原有小型过程式语言，接口与语义保持不变。
 
 ## 快速开始
 
@@ -38,6 +43,51 @@ fn handle(req) {              // 函数定义，参数即入口形参
 
 支持：`fn` 定义、赋值、表达式语句、`return`、`if/else`、`while`、字符串/数字字面量、
 标识符、函数调用、`+` 拼接、`//` 注释。嵌套调用（如 `f(g(x))`）会被降级为临时变量。
+
+## 被分析语言（Java）
+
+服务可以直接解析真实的 `.java` 源文件（无需先编译），覆盖常见 Java 结构：
+
+- `package` 声明、单类型/按需 `import`（含 `static` 导入）；
+- `class` / `interface` / `enum` / `record` / 注解类型（`@interface` 体被跳过）、
+  顶层与嵌套类型、修饰符与注解；
+- 方法、构造器（含合成默认构造器）、字段与多变量声明、实例/静态初始化块；
+- 局部变量（含 `var`）、形参、`this`/`super`；
+- 控制流：`if/else`、`while`、`do-while`、传统 `for`、增强 `for`、`switch`、
+  `try/catch/finally`（含 try-with-resources 与 multi-catch）、`throw`、
+  `break/continue`、标号语句、`synchronized`、`assert`；
+- 表达式：字符串/文本块/字符/数字字面量与转义、标识符、全部常见运算符、三元、
+  `instanceof`（含模式变量）、强制转型、括号、方法引用与 lambda（见限制）、
+  方法调用（简单/限定/`this`/`super`）、`new`（含匿名类，方法体参与分析）、
+  数组创建/访问/初始化、变长参数。
+
+### Java 污点语义
+
+- **跨方法 / 跨类 / 跨包**：调用按“接收者类型 + 方法名 + 参数个数”在类模型中解析，
+  沿 `extends`/`implements` 链查找；重载按参数个数区分，歧义按全限定名确定性决胜。
+- **静态成员**：`T.f`、`T.m()` 经导入解析为全限定名；静态字段共享
+  `$static.<全限定类名>.<字段>` 作用域，因此跨类读写同一静态字段可追踪。
+- **字段与别名**：实例字段表示为 `$this.<字段>` 及 `a.b.c` 访问路径。
+  `Order o = new Order(); Order x = o;` 这类引用拷贝建立双向别名，污点在
+  `o.f` 与 `x.f` 间互通；跨方法调用时实参对象与形参（含构造器 `this` 与返回对象）
+  按相同字段后缀双向连接。
+- **字符串拼接与对象构造**：二元运算取操作数污点并集；`new T(args)` 追踪实参到
+  构造器，并把构造期 `this` 的污点带回新对象变量。
+- **循环 / 递归 / 别名**：传播仍是有限图上的最小不动点并集，天然有界、确定；
+  路径重建步数上限 `MAX_PATH_LENGTH = 64`。
+- 只建模显式流，不建模隐式流。外部/不可解析类型的调用按“恒等函数”保守透传实参污点，
+  但项目内已定义的同名方法不会被误当作外部透传。
+
+### 支持范围与限制
+
+- 不做完整 Java 类型检查：泛型按原始类型处理，不做类型参数推断；方法分派基于
+  名字 + 参数个数，不依据形参重载类型精确选择（同名同参数个数的重载按全限定名
+  确定性地选择一个）。
+- **lambda/方法引用的声明可解析，但其通过函数式接口的间接回调不被调用建模**；
+  反射、动态代理、原生方法不跟踪。
+- 流不敏感、路径不敏感；数组不区分下标（`arr[i]` 合并到数组对象本身）。
+- 个别文件解析失败不影响其余文件（见“解析失败语义”）；个别不支持的语法特性只会
+  让该文件失败，不会阻塞整个项目。
 
 ## 分析模型
 
@@ -76,6 +126,31 @@ fn handle(req) {              // 函数定义，参数即入口形参
 - **规则变更不会混淆新旧结果**：规则变化会使全部文件摘要缓存失效（重新分析），
   每个提交各自记录 `rulesHash`；绑定旧规则哈希的豁免在新规则下自动失效。
 
+### Java 规则匹配语法
+
+对 Java 调用，每条规则的 `pattern` 会依次尝试三种名字形式，任一命中即生效：
+
+1. 全限定方法名：`com.acme.db.Dao#execute`（构造器为 `com.acme.Foo#<init>`）；
+2. 点限定静态/实例拼写：`com.acme.db.Dao.execute`（便于用包前缀写通配规则）；
+3. 裸方法名：`execute`。
+
+`*` 是通配符（映射为正则 `.*`），可出现在任意位置。示例：
+
+```json
+{
+  "sources":    [{"id": "req",  "pattern": "com.acme.web.*Request#getParam"}],
+  "sinks":      [{"id": "jdbc", "pattern": "*.execute", "severity": "CRITICAL"},
+                 {"id": "all-db","pattern": "com.acme.db.*", "severity": "HIGH"}],
+  "sanitizers": [{"id": "esc",  "pattern": "*.escapeSql"}]
+}
+```
+
+- source 在“方法返回值”处注入污点；sink 在方法的形参处暴露（路径会经过真实的
+  被调类/方法）；清洗器命中时该调用不产生任何流边（污点被切断）。
+- 无法解析到项目内方法的调用（如库方法）仍按上述三种拼写做规则匹配，因此
+  `java.sql.Statement#executeQuery` 这类外部汇点/源点规则同样生效。
+- DSL 输入只使用第 3 种（裸函数名）形式，历史规则行为不变。
+
 ## 结果语义
 
 ```json
@@ -91,8 +166,15 @@ fn handle(req) {              // 函数定义，参数即入口形参
       {"file":"a.req","function":"a","variable":"executeSql","line":3,"kind":"sink"}
     ]
   }],
-  "removedFingerprints": ["…"],    // 相对父提交消失的路径（基线对比）
-  "suppressedFingerprints": ["…"]  // 当前被有效豁免压制的路径
+  "removedFingerprints": ["…"],    // 相对父提交消失的路径指纹（基线对比）
+  "suppressedFingerprints": ["…"], // 当前被有效豁免压制的路径
+  "removedFiles": ["src/B.java"],  // 本次不再存在的文件逻辑路径
+  "addedFiles":   ["src/C.java"],  // 本次新增的文件逻辑路径
+  "parseFailures": [               // 解析失败但被隔离的文件（不阻断其它文件）
+    {"file":"src/Bad.java","line":3,"reason":"SYNTAX","message":"expected RPAREN …"}
+  ],
+  "reusedFiles": 12, "reparsedFiles": 2, "unchangedFiles": 12,
+  "failedFiles": 1, "totalFiles": 15
 }
 ```
 
@@ -100,6 +182,25 @@ fn handle(req) {              // 函数定义，参数即入口形参
 - **去重**：按 `fingerprint` 去重；相同输入与规则下同一传播路径的指纹必然相同。
 - **基线对比**：每次提交与父提交按指纹 diff，得到 `NEW / UNCHANGED / REMOVED`；
   历史提交可通过 `/commits/{id}/findings` 完整回放。
+- Java 路径的每一步都带真实的源文件名、`className`（全限定类名；静态字段为
+  `$static`，DSL 为空串）、`function`、`variable` 与源码行号。
+
+### 解析失败语义
+
+单个文件解析失败**不会**让整批提交失败，也不会被静默丢弃：
+
+- 该文件不产生摘要/结论，但同批其它文件照常分析；
+- 失败以 `parseFailures` 返回并持久化进提交，每条包含逻辑路径 `file`、1-based `line`、
+  机器可读 `reason` 与人类可读 `message`；
+- `reason` 区分失败原因：
+  - `LEXICAL` —— 词法错误（非法字符、未结束的字符串/注释、错误转义等）；
+  - `SYNTAX` —— token 合法但不符合 Java 语法（括号不匹配、缺少分隔符等）；
+  - `UNSUPPORTED` —— 语法可识别但分析器显式不支持；
+  - `IO` —— 目录扫描时的读取错误。
+- 增量分析中，未修改的失败文件沿用缓存的失败记录（计入 `failedFiles`），修改后重试。
+
+验证方式：`GET /api/projects/{p}/findings` 的 `parseFailures` 数组；文件与行号可直接
+在对应源文件中定位，`reason` 可用于区分“源码写错了”与“工具暂不支持”。
 
 ## 增量分析
 
@@ -107,6 +208,28 @@ fn handle(req) {              // 函数定义，参数即入口形参
   直接复用缓存摘要（`stats.reusedFiles`），重启后缓存从最近提交恢复、依然有效。
 - 全局合成在合并后的摘要上完整重跑，因此**不会漏报**受跨文件影响的路径；
   未受影响的路径指纹不变，状态保持 `UNCHANGED`，**不会被误标为已变化**。
+
+### 目录提交
+
+提交体新增可选字段 `directories`：一个或多个**服务端可读的本地目录**。服务递归
+发现其中所有 `.java` 文件（跳过不可读条目），以相对目录根的 `/` 分隔逻辑路径作为
+文件键，并与内联 `files` 合并（同名键以内联 `files` 为准）。接口路径与请求方式不变：
+
+```bash
+curl -X POST localhost:8080/api/projects/demo/analyses \
+  -H 'Content-Type: application/json' -d '{
+    "jobId": "scan-1",
+    "directories": ["/path/to/my-java-project/src/main/java"],
+    "files": {},
+    "rules": "{\"sources\":[...],\"sinks\":[...],\"sanitizers\":[...]}"
+  }'
+```
+
+后续提交重新扫描同一目录即可做增量：
+
+- 新增文件出现在 `addedFiles`，相关路径标记为 `NEW`；
+- 修改的文件计入 `reparsedFiles`，受影响路径更新、不受影响路径保持 `UNCHANGED`；
+- 删除的文件计入 `removedFiles`，其路径指纹进入 `removedFingerprints`。
 
 ## 豁免与审计
 
@@ -133,7 +256,7 @@ fn handle(req) {              // 函数定义，参数即入口形参
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/projects/{p}/analyses` | 提交分析（异步），body: `{files, rules, jobId?}` |
+| POST | `/api/projects/{p}/analyses` | 提交分析（异步），body: `{files, rules, jobId?, directories?}`；`directories` 为待递归扫描的 `.java` 目录数组 |
 | GET  | `/api/projects/{p}/analyses/{jobId}` | 任务状态：PENDING/RUNNING/COMMITTED/FAILED |
 | GET  | `/api/projects/{p}/findings` | 当前已提交结果（含豁免压制视图） |
 | GET  | `/api/projects/{p}/commits` | 提交历史 |
@@ -147,6 +270,14 @@ fn handle(req) {              // 函数定义，参数即入口形参
 
 ## 测试覆盖
 
-`mvn test` 共 22 个用例，覆盖：跨函数传播、清洗器拦截与绕过、循环/递归有界性、
-结果确定性、增量复用与路径状态、规则变更隔离、豁免过期/撤销/规则失效、审计完整性、
-并发读写一致性、并发提交链完整性、崩溃恢复与幂等、REST 端到端流程。
+`mvn test` 共 41 个用例，在保留全部历史 DSL 用例的基础上新增 Java 相关覆盖：
+
+- Java 解析：包/导入/类/接口/字段/方法/构造器/控制流/表达式，词法与语法错误的
+  文件/行号/原因区分；
+- Java 污点：跨方法、跨类、跨包传播，字段读写与别名，字符串拼接与对象构造，
+  继承与重载解析，静态成员跨类共享，清洗器切断，确定性与路径有界；
+- 目录提交：递归发现 `.java`、新增/修改/删除的增量体现与删除路径报告；
+- 解析失败隔离：单文件失败不影响其余文件，失败原因可区分；
+- Java 输入下的并发提交链一致性、崩溃恢复幂等、重启后增量缓存复用；
+- 大文件（深度循环/递归）与多包多文件项目的有界完成时间；
+- 目录提交、失败信息与路径字段（文件/类/方法/行号）的 REST 端到端验证。

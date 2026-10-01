@@ -144,6 +144,9 @@ public record AnalysisRules(List<SourceRule> sources,
 
     /** Exact name or glob with '*' wildcards. */
     static boolean matches(String pattern, String name) {
+        if (pattern == null || name == null) {
+            return false;
+        }
         if (pattern.indexOf('*') < 0) {
             return pattern.equals(name);
         }
@@ -156,5 +159,25 @@ public record AnalysisRules(List<SourceRule> sources,
             }
         }
         return name.matches(regex.toString());
+    }
+
+    /**
+     * Matches a Java invocation against a rule pattern. Every syntactic spelling
+     * the call may carry is tried in order:
+     * fully qualified method ({@code com.acme.Dao#query}), qualified static
+     * spelling ({@code com.acme.Dao.query}) and the bare method name. Glob
+     * patterns use '*' (e.g. {@code com.acme..*} or {@code *.execute*}).
+     */
+    public static boolean matchesJava(String pattern,
+                                      String qualifiedMethod,
+                                      String qualifiedStaticSpelling,
+                                      String bareName) {
+        if (matches(pattern, qualifiedMethod)) {
+            return true;
+        }
+        if (qualifiedStaticSpelling != null && matches(pattern, qualifiedStaticSpelling)) {
+            return true;
+        }
+        return bareName != null && matches(pattern, bareName);
     }
 }

@@ -27,6 +27,7 @@ public final class FlowGraph {
     public static final String KIND_RETURN = "return";
     public static final String KIND_CALL_RETURN = "call-return";
     public static final String KIND_SINK = "sink";
+    public static final String KIND_ALIAS = "alias";
 
     /** Separator between function and variable in node keys; never appears in identifiers. */
     private static final String SEP = "|";
@@ -54,12 +55,27 @@ public final class FlowGraph {
         nodeFile.putIfAbsent(k, file);
     }
 
+    /** Registers an already-built node key with its originating file. */
+    public void ensureNode(String key, String file) {
+        adjacency.computeIfAbsent(key, x -> new ArrayList<>());
+        nodeFile.putIfAbsent(key, file);
+    }
+
     public void addEdge(String fromFn, String fromVar, String toFn, String toVar, int line, String kind) {
         String from = key(fromFn, fromVar);
         String to = key(toFn, toVar);
         adjacency.computeIfAbsent(from, x -> new ArrayList<>())
                 .add(new Edge(from, to, line, kind));
         adjacency.computeIfAbsent(to, x -> new ArrayList<>());
+    }
+
+    /** Adds an edge between two fully built node keys; files attached explicitly. */
+    public void addNodeEdge(String from, String to, int line, String kind, String file) {
+        adjacency.computeIfAbsent(from, x -> new ArrayList<>())
+                .add(new Edge(from, to, line, kind));
+        adjacency.computeIfAbsent(to, x -> new ArrayList<>());
+        nodeFile.putIfAbsent(from, file);
+        nodeFile.putIfAbsent(to, file);
     }
 
     public void registerFile(String function, String variable, String file) {

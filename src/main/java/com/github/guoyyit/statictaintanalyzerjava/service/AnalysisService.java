@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.guoyyit.statictaintanalyzerjava.analysis.AnalysisEngine;
 import com.github.guoyyit.statictaintanalyzerjava.analysis.AnalysisResult;
 import com.github.guoyyit.statictaintanalyzerjava.analysis.Finding;
+import com.github.guoyyit.statictaintanalyzerjava.analysis.ParseFailure;
 import com.github.guoyyit.statictaintanalyzerjava.rules.AnalysisRules;
 import com.github.guoyyit.statictaintanalyzerjava.store.AuditLog;
 import com.github.guoyyit.statictaintanalyzerjava.store.CommitStore;
@@ -46,7 +47,11 @@ public class AnalysisService {
     }
 
     public record FindingsView(String commitId, String rulesHash, List<Finding> findings,
-                               List<String> removedFingerprints, Set<String> suppressedFingerprints) {
+                               List<String> removedFingerprints, Set<String> suppressedFingerprints,
+                               List<String> removedFiles, List<String> addedFiles,
+                               List<ParseFailure> parseFailures,
+                               int reusedFiles, int reparsedFiles, int unchangedFiles,
+                               int failedFiles, int totalFiles) {
     }
 
     /** Persisted job envelope: the unit of crash recovery. */
@@ -79,6 +84,16 @@ public class AnalysisService {
 
     /** Submit an analysis job; persists it first, then executes asynchronously. */
     public String submit(String project, Map<String, String> files, String rulesJson, String jobId) {
+        return submit(project, files, rulesJson, jobId, List.of());
+    }
+
+    /**
+     * Submit an analysis over inline files plus recursively discovered project
+     * directories. Directory contents are merged into {@code files}; on key
+     * collision inline files win (explicit submission is authoritative).
+     */
+    public String submit(String project, Map<String, String> files, String rulesJson,
+                         String jobId, List<String> directoryRoots) {
         validateProject(project);
         AnalysisRules.fromJson(rulesJson); // fail fast on invalid rules
         String id = (jobId == null || jobId.isBlank()) ? "job-" + UUID.randomUUID() : jobId;
@@ -86,7 +101,23 @@ public class AnalysisService {
         if (ctx.commits().hasCommitForJob(id)) {
             return id; // idempotent: already committed
         }
-        JobState state = new JobState(id, JobStatus.PENDING.name(), rulesJson, Map.copyOf(files), null, null);
+        Map<String, String> merged = new java.util.TreeMap<>();
+        if (directoryRoots != null) {
+            DirectoryScanner scanner = new DirectoryScanner();
+            for (String rootPath : directoryRoots) {
+                try {
+                    Map<String, String> discovered = scanner.scan(Path.of(rootPath), "");
+                    merged.putAll(discovered);
+                } catch (IOException e) {
+                    throw new UncheckedIOException("cannot scan directory: " + rootPath, e);
+                }
+            }
+        }
+        if (files != null) {
+            merged.putAll(files);
+        }
+        JobState state = new JobState(id, JobStatus.PENDING.name(), rulesJson,
+                Map.copyOf(merged), null, null);
         writeJob(ctx, state);
         jobViews.put(jobKey(project, id), new JobView(id, JobStatus.PENDING, null, null));
         executor.submit(() -> execute(ctx, project, state));
@@ -108,7 +139,16 @@ public class AnalysisService {
             AnalysisResult previous = ctx.commits().head().map(CommitStore.Commit::result).orElse(null);
             String previousRulesHash = previous == null ? null : previous.rulesHash();
 
-            AnalysisResult result = engine.analyze(state.files(), rules, previous);
+            List<String> removedPaths = new ArrayList<>();
+            if (previous != null) {
+                for (String oldPath : previous.fileHashes().keySet()) {
+                    if (!state.files().containsKey(oldPath)) {
+                        removedPaths.add(oldPath);
+                    }
+                }
+                removedPaths.sort(String::compareTo);
+            }
+            AnalysisResult result = engine.analyze(state.files(), rules, previous, removedPaths);
             CommitStore.Commit commit = ctx.commits().publish(state.jobId(), result);
 
             if (previousRulesHash != null && !previousRulesHash.equals(result.rulesHash())) {
@@ -168,7 +208,8 @@ public class AnalysisService {
         ProjectContext ctx = context(project);
         Optional<CommitStore.Commit> head = ctx.commits().head();
         if (head.isEmpty()) {
-            return new FindingsView(null, null, List.of(), List.of(), Set.of());
+            return new FindingsView(null, null, List.of(), List.of(), Set.of(),
+                    List.of(), List.of(), List.of(), 0, 0, 0, 0, 0);
         }
         return toView(ctx, head.get());
     }
@@ -186,7 +227,12 @@ public class AnalysisService {
             suppressed.add(e.fingerprint());
         }
         return new FindingsView(commit.meta().commitId(), rulesHash, commit.result().findings(),
-                commit.result().removedFingerprints(), suppressed);
+                commit.result().removedFingerprints(), suppressed,
+                commit.result().removedFiles(), commit.result().addedFiles(),
+                commit.result().parseFailures(),
+                commit.result().stats().reusedFiles(), commit.result().stats().reparsedFiles(),
+                commit.result().stats().unchangedFiles(), commit.result().stats().failedFiles(),
+                commit.result().stats().totalFiles());
     }
 
     public Optional<AnalysisResult> commitResult(String project, String commitId) {
