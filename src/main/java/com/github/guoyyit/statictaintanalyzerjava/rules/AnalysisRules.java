@@ -157,4 +157,47 @@ public record AnalysisRules(List<SourceRule> sources,
         }
         return name.matches(regex.toString());
     }
+
+    /**
+     * Matches a rule pattern against any of the Java callee tokens of a call.
+     * Tokens include the fully qualified method name ({@code pkg.C#m(...)}),
+     * the qualified name without descriptor ({@code pkg.C#m}), the simple
+     * method name and the owner FQN. A '*' works as a glob wildcard (so prefix
+     * patterns like {@code com.acme.web.*} match whole package subtrees).
+     */
+    public boolean matchesAny(String pattern, java.util.Collection<String> tokens) {
+        for (String token : tokens) {
+            if (token != null && !token.isEmpty() && matches(pattern, token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public SourceRule matchSource(java.util.Collection<String> tokens) {
+        for (SourceRule r : sources) {
+            if (matchesAny(r.pattern(), tokens)) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    public SinkRule matchSink(java.util.Collection<String> tokens) {
+        for (SinkRule r : sinks) {
+            if (matchesAny(r.pattern(), tokens)) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    public boolean isSanitizer(java.util.Collection<String> tokens) {
+        for (SanitizerRule r : sanitizers) {
+            if (matchesAny(r.pattern(), tokens)) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

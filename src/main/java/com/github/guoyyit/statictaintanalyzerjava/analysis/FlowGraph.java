@@ -27,12 +27,20 @@ public final class FlowGraph {
     public static final String KIND_RETURN = "return";
     public static final String KIND_CALL_RETURN = "call-return";
     public static final String KIND_SINK = "sink";
+    public static final String KIND_FIELD_READ = "field-read";
+    public static final String KIND_FIELD_WRITE = "field-write";
+    public static final String KIND_RECEIVER = "receiver";
+
+    /** Display descriptor for a node key. DSL nodes carry only the function name. */
+    public record Descriptor(String file, String className, String method, String displayVar) {
+    }
 
     /** Separator between function and variable in node keys; never appears in identifiers. */
     private static final String SEP = "|";
 
     private final Map<String, List<Edge>> adjacency = new LinkedHashMap<>();
     private final Map<String, String> nodeFile = new LinkedHashMap<>();
+    private final Map<String, Descriptor> descriptors = new LinkedHashMap<>();
 
     public static String key(String function, String variable) {
         return function + SEP + variable;
@@ -52,6 +60,7 @@ public final class FlowGraph {
         String k = key(function, variable);
         adjacency.computeIfAbsent(k, x -> new ArrayList<>());
         nodeFile.putIfAbsent(k, file);
+        descriptors.putIfAbsent(k, new Descriptor(file, function, function, variable));
     }
 
     public void addEdge(String fromFn, String fromVar, String toFn, String toVar, int line, String kind) {
@@ -64,6 +73,33 @@ public final class FlowGraph {
 
     public void registerFile(String function, String variable, String file) {
         nodeFile.putIfAbsent(key(function, variable), file);
+    }
+
+    public void registerDescriptor(String function, String variable, Descriptor descriptor) {
+        String k = key(function, variable);
+        adjacency.computeIfAbsent(k, x -> new ArrayList<>());
+        descriptors.put(k, descriptor);
+        nodeFile.put(k, descriptor.file());
+    }
+
+    public void registerDescriptor2(String key, Descriptor descriptor) {
+        adjacency.computeIfAbsent(key, x -> new ArrayList<>());
+        descriptors.put(key, descriptor);
+        nodeFile.put(key, descriptor.file());
+    }
+
+    public Descriptor descriptorOf(String key) {
+        Descriptor d = descriptors.get(key);
+        if (d != null) {
+            return d;
+        }
+        return new Descriptor(fileOf(key), functionOf(key), functionOf(key), variableOf(key));
+    }
+
+    public void addEdgeKey(String from, String to, int line, String kind) {
+        adjacency.computeIfAbsent(from, x -> new ArrayList<>())
+                .add(new Edge(from, to, line, kind));
+        adjacency.computeIfAbsent(to, x -> new ArrayList<>());
     }
 
     public String fileOf(String key) {

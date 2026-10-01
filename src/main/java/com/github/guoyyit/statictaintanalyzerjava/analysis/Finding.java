@@ -20,6 +20,12 @@ public record Finding(String fingerprint,
     public static final String STATUS_UNCHANGED = "UNCHANGED";
     public static final String STATUS_REMOVED = "REMOVED";
 
-    public record Step(String file, String function, String variable, int line, String kind) {
+    public record Step(String file, String className, String method, String function,
+                       String variable, int line, String kind) {
+
+        /** DSL step: class/member coincide with the function name. */
+        public Step(String file, String function, String variable, int line, String kind) {
+            this(file, function, function, function, variable, line, kind);
+        }
     }
 }

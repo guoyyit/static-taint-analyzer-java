@@ -3,14 +3,19 @@
 本地源代码污点分析服务：从数据入口（source）追踪不可信值向敏感汇点（sink）的传播路径，
 产出**可复现、可审计**的分析结论。基于 Spring Boot，数据全部落在本地文件系统。
 
+支持两种输入语言：
+
+- **真实 Java 源代码**（`.java`，默认按目录提交，也可随请求内联提交）；
+- 历史小型过程式 **DSL**（`.req`，原有能力保持不变）。
+
 ## 快速开始
 
 ```bash
 mvn spring-boot:run          # 启动服务（默认端口 8080，数据目录 ./data）
-mvn test                     # 运行全部自动化测试
+mvn test                     # 运行全部自动化测试（离线可复现）
 ```
 
-提交一次分析：
+提交一次分析（内联文件，DSL/Java 均可）：
 
 ```bash
 curl -X POST localhost:8080/api/projects/demo/analyses -H 'Content-Type: application/json' -d '{
@@ -22,59 +27,96 @@ curl localhost:8080/api/projects/demo/analyses/job-1   # 查询任务状态
 curl localhost:8080/api/projects/demo/findings         # 查询已提交结果
 ```
 
-## 被分析语言（DSL）
+按**目录**提交一个 Java 项目（服务端递归扫描其中所有 `.java` 文件）：
 
-分析对象是一种小型过程式语言，每个文件可定义多个函数，函数名在项目内全局可见（跨模块调用按名字解析）：
-
-```
-fn handle(req) {              // 函数定义，参数即入口形参
-  name = readParam("name");   // 赋值 / 调用
-  q = "SELECT " + name;       // 二元拼接
-  if (q) { log(q); } else { log("empty"); }
-  while (name) { name = trim(name); }
-  return q;
-}
+```bash
+curl -X POST localhost:8080/api/projects/demo/analyses -H 'Content-Type: application/json' -d '{
+  "jobId": "job-java-1",
+  "directory": "/abs/path/to/java-project",
+  "rules": "{\"sources\":[{\"id\":\"http\",\"pattern\":\"com.acme.web.Http#param\"}],\"sinks\":[{\"id\":\"sql\",\"pattern\":\"com.acme.db.*\"}],\"sanitizers\":[]}"
+}'
 ```
 
-支持：`fn` 定义、赋值、表达式语句、`return`、`if/else`、`while`、字符串/数字字面量、
-标识符、函数调用、`+` 拼接、`//` 注释。嵌套调用（如 `f(g(x))`）会被降级为临时变量。
+- 请求路径、方法与原有接口完全一致，仅新增**可选**字段 `directory`。
+- `directory` 为服务端可读的**绝对路径**；键统一为相对扫描根、使用 `/` 分隔的路径
+  （如 `com/acme/Foo.java`），多次扫描路径稳定可比较。
+- `files`（内联）与 `directory` 可同时提供；路径冲突时目录内容优先。
+- 作业会持久化目录路径，在执行时（以及崩溃恢复后）重新扫描，因此文件的
+  **新增 / 修改 / 删除**都会在增量分析中体现；被删除文件出现在 `removedFiles`，
+  未变化文件保持哈希不变并复用摘要缓存。
+
+## 支持的 Java 语言范围与限制
+
+解析器为 [JavaParser](https://javaparser.org)（Java 17 语法级），覆盖常见结构：
+
+- 包声明、`import`（单类型、按需 `.*`、静态导入）；
+- `class` / `interface` / `enum` / `record`、嵌套类型、匿名类、枚举常量体；
+- 方法、构造器（含 `this(...)`/`super(...)`）、字段及字段初始化、静态/实例初始化块；
+- 形参、局部变量（含 `var`、try-with-resources、catch 参数、增强 for 变量）；
+- 控制流：`if/else`、`while`、`do-while`、`for`、增强 `for`、`switch`（含 `switch` 表达式）、
+  `try/catch/finally`、`throw`、`assert`、`synchronized`、标号语句、`yield`；
+- 表达式：字面量、标识符、各种二元/一元运算、三元、`instanceof`、强制转换、
+  字符串拼接、数组访问/创建/初始化、Lambda、方法引用；
+- 方法调用（限定/非限定/静态/链式）、对象创建 `new`、字段读写（`this.f`、`obj.f`、`Type.f`）；
+- 继承与接口实现（沿父类/接口链解析）、方法重载（按参数元数筛选）、静态成员。
+
+**限制（有意为之的保守近似，不是编译器）**：
+
+- 不做完整 Java 类型检查与外部 classpath 解析；无法静态确定接收者类型时
+  采用**保守连接**（调用结果继承实参/接收者污点），宁可多报不漏报。
+- 仅建模**显式流**（赋值、拼接、传参/返回、字段、对象构造）；不建模隐式流、
+  反射、动态加载、原生方法语义。
+- 方法解析为结构化解析：项目类型 → 显式导入 → 同包 → 按需导入 → 嵌套类型 → `java.lang`。
+- 传播是有限图上的最小不动点并集，循环、递归与别名天然有界且确定；
+  重建路径长度上限 `MAX_PATH_LENGTH = 64`。
+- 单个文件解析/降级失败只影响该文件，其余文件照常分析。
 
 ## 分析模型
 
 分析分三个阶段，全程**确定性**（相同输入 + 相同规则 ⇒ 相同结果）：
 
-1. **函数摘要（过程内）**：每个函数独立提取流事实——赋值边、调用点（实参→形参、
-   返回值→左值）、return、source 注入点、sink 暴露点。清洗器（sanitizer）调用
-   **不产生**流边（污点被切断）。摘要只依赖本文件内容与规则，因此可按
-   `sha256(文件内容)+规则哈希` 缓存，是增量分析的基础。
-2. **全局流图 + 污点传播（过程间）**：把摘要拼成全程序流图。节点为
-   `(函数, 变量)`，另有合成节点 `$ret`（返回值）与 `$sink:<行>:<规则>`（汇点）。
-   调用边连接实参与形参、返回值与左值；未解析的外部调用按保守策略把实参污点
-   透传到返回值。传播是有限图上的**最小不动点并集**，因此：
-   - **循环 / 递归**：天然终止，不会栈溢出或发散；
-   - **别名**：`a = b` 即污点复制，两个名字共享同一污点集；
-   - 结果与迭代顺序无关。
-3. **路径重建**：对每个 (source, sink) 标签对，在流图上做**邻居排序的 BFS**
-   取最短路径，路径长度上限 64 步（`MAX_PATH_LENGTH`），保证有界且唯一。
+1. **成员摘要（过程内）**：解析后把每个方法/构造器/字段初始化降级为流事实——
+   赋值边、调用点（实参→形参、接收者→`this`、返回值→左值）、`return`、
+   字段读（`field → 临时变量`）、字段写（`源 → field`）。清洗器调用切断污点。
+   摘要只依赖本文件内容与规则，按 `sha256(文件内容)+规则哈希` 缓存。
+2. **全程序图 + 污点传播（过程间）**：`ClassIndex` 负责跨类/跨包解析
+   （导入、同包、继承链、重载元数）；节点为 `(成员, 变量)`，字段为全局节点
+   `field:owner#name`（别名共享），另有合成节点 `$ret`、`$sink:...`。
+   未解析的外部调用保守透传实参/接收者污点。传播为有限图上的 worklist 最小不动点，
+   循环/递归终止、结果与迭代顺序无关。
+3. **路径重建**：邻居排序的 BFS 取最短路径，长度上限 64，结果唯一可复现。
 
-只建模**显式流**（赋值、拼接、调用传参/返回），不建模隐式流（条件分支不影响污点）。
+成员键形如 `pkg.C#m(argTypes)`，构造器为 `pkg.C#<init>(argTypes)`，因此重载与跨类调用可区分。
 
 ## 规则格式（声明式）
 
-规则为 JSON，随分析请求提交；`pattern` 匹配被调函数名，支持精确名或 `*` 通配：
+规则为 JSON，随分析请求提交；`pattern` 支持精确名与 `*` 通配。
+
+- **DSL 调用**：按被调函数名匹配（如 `readParam`、`escape*`）。
+- **Java 调用**：对同一调用点生成多个匹配令牌，任一命中即可：
+  - 简单方法名：`param`
+  - 完整限定方法：`com.acme.web.Http#param`、`com.acme.web.Http.param`
+  - 拥有者 FQN：`com.acme.web.Http`
+  - 简单类名形式：`Http#param`
+
+  因此以下写法都合法：
+
+  - `com.acme.web.Http#param`（精确到方法）
+  - `com.acme.web.*`（包前缀通配，覆盖该包/子包下调用）
+  - `Http#param`（简单类名）
+  - `param`（仅按方法名，等价于 DSL 风格）
+
+`severity`：`INFO < LOW < MEDIUM < HIGH < CRITICAL`（source 默认 MEDIUM，sink 默认 HIGH）。
+规则集按 id 排序生成规范 JSON，其 SHA-256 为 `rulesHash`；规则变化会使全部文件摘要缓存失效，
+每个提交各自绑定 `rulesHash`，绑定旧哈希的豁免在新规则下自动失效。
 
 ```json
 {
-  "sources":    [{"id": "user-input", "pattern": "readParam",  "severity": "HIGH"}],
-  "sinks":      [{"id": "sql-exec",   "pattern": "executeSql", "severity": "CRITICAL"}],
-  "sanitizers": [{"id": "escape",     "pattern": "escape*"}]
+  "sources":    [{"id": "http", "pattern": "com.acme.web.Http#param", "severity": "HIGH"}],
+  "sinks":      [{"id": "sql",  "pattern": "com.acme.db.*",          "severity": "CRITICAL"}],
+  "sanitizers": [{"id": "enc",  "pattern": "com.acme.Enc#encode"}]
 }
 ```
-
-- `severity`：`INFO < LOW < MEDIUM < HIGH < CRITICAL`（source 默认 MEDIUM，sink 默认 HIGH）。
-- 规则集按 id 排序后生成**规范 JSON**，其 SHA-256 为 `rulesHash`，绑定到每次提交。
-- **规则变更不会混淆新旧结果**：规则变化会使全部文件摘要缓存失效（重新分析），
-  每个提交各自记录 `rulesHash`；绑定旧规则哈希的豁免在新规则下自动失效。
 
 ## 结果语义
 
@@ -82,60 +124,53 @@ fn handle(req) {              // 函数定义，参数即入口形参
 {
   "commitId": "c…", "rulesHash": "…",
   "findings": [{
-    "fingerprint": "…",            // 路径规范签名的 SHA-256，稳定可复现
-    "sourceRuleId": "user-input", "sinkRuleId": "sql-exec",
-    "severity": "CRITICAL",        // max(source, sink) 严重度
-    "status": "NEW",               // NEW | UNCHANGED（相对父提交）
-    "path": [                      // source → … → sink 的完整传播路径
-      {"file":"a.req","function":"a","variable":"x","line":2,"kind":"source"},
-      {"file":"a.req","function":"a","variable":"executeSql","line":3,"kind":"sink"}
+    "fingerprint": "…",
+    "sourceRuleId": "http", "sinkRuleId": "sql",
+    "severity": "CRITICAL",
+    "status": "NEW",
+    "path": [
+      {"file":"src/com/acme/web/Handler.java","className":"com.acme.web.Handler",
+       "method":"handle","function":"com.acme.web.Handler#handle(com.acme.web.Handler)",
+       "variable":"name","line":12,"kind":"source"},
+      {"file":"…","className":"…","method":"…","function":"…","variable":"…","line":…,"kind":"sink"}
     ]
   }],
-  "removedFingerprints": ["…"],    // 相对父提交消失的路径（基线对比）
-  "suppressedFingerprints": ["…"]  // 当前被有效豁免压制的路径
+  "removedFingerprints": ["…"],
+  "suppressedFingerprints": ["…"],
+  "parseFailures": [
+    {"file":"com/acme/Broken.java","line":7,"code":"SYNTAX_ERROR","message":"…"}
+  ],
+  "removedFiles": ["com/acme/Old.java"],
+  "stats": {"reusedFiles": 10, "reparsedFiles": 2, "failedFiles": 1, "removedFiles": 1}
 }
 ```
 
-- **排序**：严重度降序 → 路径长度升序 → 指纹字典序（全序，稳定）。
-- **去重**：按 `fingerprint` 去重；相同输入与规则下同一传播路径的指纹必然相同。
-- **基线对比**：每次提交与父提交按指纹 diff，得到 `NEW / UNCHANGED / REMOVED`；
-  历史提交可通过 `/commits/{id}/findings` 完整回放。
+每个路径步骤都带**真实源文件名、类名、方法名、变量名与行号**；DSL 结果中
+`className`/`method` 退化为函数名以保持向后兼容。
 
-## 增量分析
+### 解析失败语义
 
-- 只有**内容哈希变化**的文件会重新解析与摘要（`stats.reparsedFiles`），未变化文件
-  直接复用缓存摘要（`stats.reusedFiles`），重启后缓存从最近提交恢复、依然有效。
-- 全局合成在合并后的摘要上完整重跑，因此**不会漏报**受跨文件影响的路径；
-  未受影响的路径指纹不变，状态保持 `UNCHANGED`，**不会被误标为已变化**。
+`parseFailures` 中每条记录都包含 `file`（文件名）、`line`（1 起始行号；无法定位为 `0`）、
+`code`（机器可读错误码）与 `message`：
 
-## 豁免与审计
+- `LEXICAL_ERROR`：词法错误（非法字符、未结束的字符串/字符字面量等，JavaParser `TokenMgrException`）；
+- `SYNTAX_ERROR`：令牌无法构成合法 Java 语法；
+- `IO_ERROR`：读取目录/文件失败；
+- `INTERNAL_ERROR`：降级阶段的内部/暂不支持构造。
 
-- 豁免绑定 `(fingerprint, rulesHash)`，可设 `expiresAt`；仅当未撤销、未过期、
-  且规则哈希与当前提交一致时才压制告警。**豁免过期、被撤销或规则变更后自动恢复检测**。
-- 所有变更写入只追加的 `audit.log`：`ANALYSIS_COMMITTED`、`RULES_CHANGED`、
-  `EXEMPTION_CREATED`、`EXEMPTION_REVOKED`，带单调序号、时间与操作者。
+失败**不会**令作业失败或静默丢弃整批文件：成功文件照常产出 findings，失败文件计入
+`stats.failedFiles`，相同内容下失败信息稳定，可在 `GET …/findings` 中核验。
 
-## 并发与一致性
-
-- 单个后台写线程串行执行任务；读请求只读取 `HEAD` 指向的**不可变提交快照**，
-  因此提交与查询可并发进行，读取方永远看不到半成品或中间状态。
-- 提交协议：写 `journal/<id>.tmp` → 原子 rename 到 `commits/<id>` → 原子替换 `HEAD`。
-
-## 中断与崩溃恢复
-
-- 任务先持久化到 `jobs/<jobId>.json` 再执行；提交 id 由 `(jobId, parentId, rulesHash)`
-  决定，**幂等**。
-- 重启时 `recoverAll()`：清理半成品 journal、校验 `HEAD`、扫描任务文件——
-  已提交的任务绝不重跑；`PENDING/RUNNING` 的任务从最近一次已提交位置继续执行，
-  不重复分析、不跳过变更、不留部分写入。
+其余语义（排序、去重、基线 diff、`NEW/UNCHANGED/REMOVED`、增量复用、豁免与审计、
+并发一致性、崩溃恢复）与历史版本一致，且在目录/Java 输入下继续成立。
 
 ## HTTP API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/projects/{p}/analyses` | 提交分析（异步），body: `{files, rules, jobId?}` |
+| POST | `/api/projects/{p}/analyses` | 提交分析（异步），body: `{files?, rules, jobId?, directory?}` |
 | GET  | `/api/projects/{p}/analyses/{jobId}` | 任务状态：PENDING/RUNNING/COMMITTED/FAILED |
-| GET  | `/api/projects/{p}/findings` | 当前已提交结果（含豁免压制视图） |
+| GET  | `/api/projects/{p}/findings` | 当前已提交结果（含失败、移除文件、豁免压制视图） |
 | GET  | `/api/projects/{p}/commits` | 提交历史 |
 | GET  | `/api/projects/{p}/commits/{id}/findings` | 指定提交的结果 |
 | POST | `/api/projects/{p}/exemptions` | 创建豁免 `{fingerprint, reason, createdBy, expiresAt?}` |
@@ -147,6 +182,15 @@ fn handle(req) {              // 函数定义，参数即入口形参
 
 ## 测试覆盖
 
-`mvn test` 共 22 个用例，覆盖：跨函数传播、清洗器拦截与绕过、循环/递归有界性、
-结果确定性、增量复用与路径状态、规则变更隔离、豁免过期/撤销/规则失效、审计完整性、
-并发读写一致性、并发提交链完整性、崩溃恢复与幂等、REST 端到端流程。
+`mvn test` 覆盖（离线可复现）：历史 DSL 的全部回归（跨函数、清洗器、循环/递归有界、
+确定性、增量、规则隔离、豁免过期/撤销、审计、并发、崩溃恢复、REST 端到端），以及新增
+Java 能力：
+
+- 真实 Java 源码的跨方法、跨类、跨包传播；
+- 字段读写与别名、对象构造把实参污点带入对象字段；
+- 继承链与按元数的重载解析；
+- 规则按完整限定名 / 通配包前缀匹配 Java 调用；
+- 目录增量提交：新增 / 修改 / 删除（`removedFiles`）与未变化复用；
+- 解析失败隔离、词法/语法错误码区分、其余文件正常分析；
+- Java 输入下的并发提交链一致性与崩溃恢复（含目录作业重启重扫、幂等）；
+- 多包大量文件（120+ 类）的有界完成时间。

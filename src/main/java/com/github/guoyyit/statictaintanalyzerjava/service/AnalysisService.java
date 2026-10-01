@@ -46,12 +46,37 @@ public class AnalysisService {
     }
 
     public record FindingsView(String commitId, String rulesHash, List<Finding> findings,
-                               List<String> removedFingerprints, Set<String> suppressedFingerprints) {
+                               List<String> removedFingerprints, Set<String> suppressedFingerprints,
+                               List<ParseFailureView> parseFailures, List<String> removedFiles,
+                               StatsView stats) {
+    }
+
+    public record ParseFailureView(String file, int line, String code, String message) {
+    }
+
+    public record StatsView(int reusedFiles, int reparsedFiles, int failedFiles, int removedFiles) {
     }
 
     /** Persisted job envelope: the unit of crash recovery. */
     record JobState(String jobId, String status, String rules, Map<String, String> files,
+                    String directory,
                     String commitId, String error) {
+        @com.fasterxml.jackson.annotation.JsonCreator
+        JobState(@com.fasterxml.jackson.annotation.JsonProperty("jobId") String jobId,
+                 @com.fasterxml.jackson.annotation.JsonProperty("status") String status,
+                 @com.fasterxml.jackson.annotation.JsonProperty("rules") String rules,
+                 @com.fasterxml.jackson.annotation.JsonProperty("files") Map<String, String> files,
+                 @com.fasterxml.jackson.annotation.JsonProperty("directory") String directory,
+                 @com.fasterxml.jackson.annotation.JsonProperty("commitId") String commitId,
+                 @com.fasterxml.jackson.annotation.JsonProperty("error") String error) {
+            this.jobId = jobId;
+            this.status = status;
+            this.rules = rules;
+            this.files = files == null ? Map.of() : Map.copyOf(files);
+            this.directory = directory;
+            this.commitId = commitId;
+            this.error = error;
+        }
     }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -79,14 +104,30 @@ public class AnalysisService {
 
     /** Submit an analysis job; persists it first, then executes asynchronously. */
     public String submit(String project, Map<String, String> files, String rulesJson, String jobId) {
+        return submit(project, files, rulesJson, jobId, null);
+    }
+
+    /**
+     * Submit an analysis job. When {@code directory} is provided, it is scanned
+     * recursively for {@code .java} files at execution time (and again on crash
+     * recovery), so additions, deletions and modifications are all reflected;
+     * inline {@code files} are merged, with directory entries winning on clash.
+     */
+    public String submit(String project, Map<String, String> files, String rulesJson, String jobId,
+                         String directory) {
         validateProject(project);
         AnalysisRules.fromJson(rulesJson); // fail fast on invalid rules
+        Map<String, String> inline = files == null ? Map.of() : Map.copyOf(files);
+        if (directory != null && !directory.isBlank()) {
+            // Fail fast on an unreadable scan root.
+            DirectoryScanner.scan(directory);
+        }
         String id = (jobId == null || jobId.isBlank()) ? "job-" + UUID.randomUUID() : jobId;
         ProjectContext ctx = context(project);
         if (ctx.commits().hasCommitForJob(id)) {
             return id; // idempotent: already committed
         }
-        JobState state = new JobState(id, JobStatus.PENDING.name(), rulesJson, Map.copyOf(files), null, null);
+        JobState state = new JobState(id, JobStatus.PENDING.name(), rulesJson, inline, directory, null, null);
         writeJob(ctx, state);
         jobViews.put(jobKey(project, id), new JobView(id, JobStatus.PENDING, null, null));
         executor.submit(() -> execute(ctx, project, state));
@@ -102,13 +143,14 @@ public class AnalysisService {
             }
             jobViews.put(key, new JobView(state.jobId(), JobStatus.RUNNING, null, null));
             writeJob(ctx, new JobState(state.jobId(), JobStatus.RUNNING.name(), state.rules(),
-                    state.files(), null, null));
+                    state.files(), state.directory(), null, null));
 
             AnalysisRules rules = AnalysisRules.fromJson(state.rules());
             AnalysisResult previous = ctx.commits().head().map(CommitStore.Commit::result).orElse(null);
             String previousRulesHash = previous == null ? null : previous.rulesHash();
 
-            AnalysisResult result = engine.analyze(state.files(), rules, previous);
+            DirectoryScanner.ScanResult scan = collectInputs(state);
+            AnalysisResult result = engine.analyze(scan.files(), rules, previous, scan.failures());
             CommitStore.Commit commit = ctx.commits().publish(state.jobId(), result);
 
             if (previousRulesHash != null && !previousRulesHash.equals(result.rulesHash())) {
@@ -123,16 +165,26 @@ public class AnalysisService {
                             + " reusedFiles=" + result.stats().reusedFiles()
                             + " reparsedFiles=" + result.stats().reparsedFiles());
             markCommitted(ctx, key, new JobState(state.jobId(), JobStatus.COMMITTED.name(),
-                    state.rules(), state.files(), commit.meta().commitId(), null));
+                    state.rules(), state.files(), state.directory(), commit.meta().commitId(), null));
         } catch (Throwable t) {
             jobViews.put(key, new JobView(state.jobId(), JobStatus.FAILED, null, String.valueOf(t)));
             try {
                 writeJob(ctx, new JobState(state.jobId(), JobStatus.FAILED.name(), state.rules(),
-                        state.files(), null, String.valueOf(t)));
+                        state.files(), state.directory(), null, String.valueOf(t)));
             } catch (Throwable ignored) {
                 // keep original failure
             }
         }
+    }
+
+    private static DirectoryScanner.ScanResult collectInputs(JobState state) {
+        if (state.directory() == null || state.directory().isBlank()) {
+            return new DirectoryScanner.ScanResult(state.files(), List.of());
+        }
+        Map<String, String> merged = new java.util.TreeMap<>(state.files());
+        DirectoryScanner.ScanResult scan = DirectoryScanner.scan(state.directory());
+        merged.putAll(scan.files());
+        return new DirectoryScanner.ScanResult(Map.copyOf(merged), scan.failures());
     }
 
     private void markCommitted(ProjectContext ctx, String key, JobState state) {
@@ -144,7 +196,7 @@ public class AnalysisService {
         }
         jobViews.put(key, new JobView(state.jobId(), JobStatus.COMMITTED, commitId, null));
         writeJob(ctx, new JobState(state.jobId(), JobStatus.COMMITTED.name(), state.rules(),
-                state.files(), commitId, null));
+                state.files(), state.directory(), commitId, null));
     }
 
     // -------------------------------------------------------------- query
@@ -168,7 +220,8 @@ public class AnalysisService {
         ProjectContext ctx = context(project);
         Optional<CommitStore.Commit> head = ctx.commits().head();
         if (head.isEmpty()) {
-            return new FindingsView(null, null, List.of(), List.of(), Set.of());
+            return new FindingsView(null, null, List.of(), List.of(), Set.of(),
+                    List.of(), List.of(), new StatsView(0, 0, 0, 0));
         }
         return toView(ctx, head.get());
     }
@@ -185,8 +238,14 @@ public class AnalysisService {
         for (ExemptionStore.Exemption e : ctx.exemptions().activeFor(rulesHash, Instant.now())) {
             suppressed.add(e.fingerprint());
         }
-        return new FindingsView(commit.meta().commitId(), rulesHash, commit.result().findings(),
-                commit.result().removedFingerprints(), suppressed);
+        AnalysisResult result = commit.result();
+        List<ParseFailureView> failures = result.parseFailures().stream()
+                .map(f -> new ParseFailureView(f.file(), f.line(), f.code(), f.message()))
+                .toList();
+        return new FindingsView(commit.meta().commitId(), rulesHash, result.findings(),
+                result.removedFingerprints(), suppressed, failures, result.removedFiles(),
+                new StatsView(result.stats().reusedFiles(), result.stats().reparsedFiles(),
+                        result.stats().failedFiles(), result.stats().removedFiles()));
     }
 
     public Optional<AnalysisResult> commitResult(String project, String commitId) {
@@ -274,7 +333,8 @@ public class AnalysisService {
             // from the last committed position; the commit id is deterministic.
             jobViews.put(key, new JobView(state.jobId(), JobStatus.PENDING, null, null));
             executor.submit(() -> execute(ctx, project,
-                    new JobState(state.jobId(), JobStatus.PENDING.name(), state.rules(), state.files(), null, null)));
+                    new JobState(state.jobId(), JobStatus.PENDING.name(), state.rules(),
+                            state.files(), state.directory(), null, null)));
             return;
         }
         if (JobStatus.FAILED.name().equals(state.status())) {

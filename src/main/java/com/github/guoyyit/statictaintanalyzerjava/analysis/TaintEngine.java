@@ -32,28 +32,38 @@ public final class TaintEngine {
     public static final int MAX_PATH_LENGTH = 64;
 
     /** A taint label: where the untrusted value entered the program. */
-    public record SourceLabel(String ruleId, String file, int line) implements Comparable<SourceLabel> {
+    public record SourceLabel(String ruleId, String file, int line, String site)
+            implements Comparable<SourceLabel> {
+
+        /** DSL label (no call-site discriminator). */
+        public SourceLabel(String ruleId, String file, int line) {
+            this(ruleId, file, line, "");
+        }
+
         @Override
         public int compareTo(SourceLabel o) {
             int c = ruleId.compareTo(o.ruleId);
             if (c != 0) return c;
             c = file.compareTo(o.file);
-            return c != 0 ? c : Integer.compare(line, o.line);
+            if (c != 0) return c;
+            c = Integer.compare(line, o.line);
+            return c != 0 ? c : site.compareTo(o.site);
         }
         @Override
         public String toString() {
-            return ruleId + "@" + file + ":" + line;
+            return ruleId + "@" + file + ":" + line + (site.isEmpty() ? "" : ":" + site);
         }
     }
 
-    private record SinkPoint(String nodeKey, String ruleId, String function, String file, int line) {
+    record SinkPoint(String nodeKey, String ruleId, String function, String file, int line) {
     }
 
     public List<Finding> analyze(Map<String, FunctionSummary> summaries, AnalysisRules rules) {
         FlowGraph graph = new FlowGraph();
         Map<SourceLabel, String> labelOrigin = new TreeMap<>();
         List<SinkPoint> sinkPoints = new ArrayList<>();
-        buildGraph(summaries, graph, labelOrigin, sinkPoints);
+        ClassIndex classIndex = ClassIndex.build(new ArrayList<>(summaries.values()));
+        buildGraph(summaries, classIndex, graph, labelOrigin, sinkPoints, rules);
 
         Map<String, Set<SourceLabel>> taint = propagate(graph, labelOrigin);
 
@@ -98,10 +108,33 @@ public final class TaintEngine {
     // ---------------------------------------------------------------- graph
 
     private void buildGraph(Map<String, FunctionSummary> summaries,
+                            ClassIndex classIndex,
+                            FlowGraph graph,
+                            Map<SourceLabel, String> labelOrigin,
+                            List<SinkPoint> sinkPoints,
+                            AnalysisRules rules) {
+        List<FunctionSummary> dsl = new ArrayList<>();
+        List<FunctionSummary> java = new ArrayList<>();
+        for (FunctionSummary fn : summaries.values()) {
+            if (fn.ownerClass() != null && !fn.ownerClass().isEmpty()) {
+                java.add(fn);
+            } else {
+                dsl.add(fn);
+            }
+        }
+        buildDslGraph(dsl, graph, labelOrigin, sinkPoints);
+        JavaGraphBuilder.build(java, classIndex, rules, graph, labelOrigin, sinkPoints);
+    }
+
+    private void buildDslGraph(List<FunctionSummary> summaries,
                             FlowGraph graph,
                             Map<SourceLabel, String> labelOrigin,
                             List<SinkPoint> sinkPoints) {
-        for (FunctionSummary fn : summaries.values()) {
+        Map<String, FunctionSummary> byName = new LinkedHashMap<>();
+        for (FunctionSummary s : summaries) {
+            byName.put(s.functionName(), s);
+        }
+        for (FunctionSummary fn : summaries) {
             for (String param : fn.params()) {
                 graph.registerFile(fn.functionName(), param, fn.file());
             }
@@ -119,9 +152,9 @@ public final class TaintEngine {
                 }
             }
         }
-        for (FunctionSummary fn : summaries.values()) {
+        for (FunctionSummary fn : summaries) {
             for (FunctionSummary.CallFact call : fn.calls()) {
-                FunctionSummary callee = summaries.get(call.callee());
+                FunctionSummary callee = byName.get(call.callee());
                 if (callee != null) {
                     int bound = Math.min(call.argVars().size(), callee.params().size());
                     for (int i = 0; i < bound; i++) {
@@ -229,17 +262,19 @@ public final class TaintEngine {
                               Map<String, AnalysisRules.SourceRule> sourceRules,
                               Map<String, AnalysisRules.SinkRule> sinkRules) {
         List<Finding.Step> steps = new ArrayList<>();
-        steps.add(new Finding.Step(label.file(), FlowGraph.functionOf(origin),
-                FlowGraph.variableOf(origin), label.line(), "source"));
+        FlowGraph.Descriptor originDesc = graph.descriptorOf(origin);
+        steps.add(new Finding.Step(label.file(), originDesc.className(), originDesc.method(),
+                FlowGraph.functionOf(origin), FlowGraph.variableOf(origin), label.line(), "source"));
         for (FlowGraph.Edge edge : path) {
             String kind = edge.kind();
-            String variable = FlowGraph.variableOf(edge.toKey());
+            FlowGraph.Descriptor desc = graph.descriptorOf(edge.toKey());
+            String variable = desc.displayVar();
             if (FlowGraph.KIND_SINK.equals(kind)) {
                 kind = "sink";
                 variable = sink.ruleId();
             }
-            steps.add(new Finding.Step(graph.fileOf(edge.toKey()), FlowGraph.functionOf(edge.toKey()),
-                    variable, edge.line(), kind));
+            steps.add(new Finding.Step(desc.file(), desc.className(), desc.method(),
+                    FlowGraph.functionOf(edge.toKey()), variable, edge.line(), kind));
         }
         Severity sourceSev = sourceRules.containsKey(label.ruleId())
                 ? sourceRules.get(label.ruleId()).severity() : Severity.MEDIUM;
